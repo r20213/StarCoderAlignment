@@ -1,5 +1,5 @@
 import logging
-from datasets import load_dataset, Dataset, DatasetDict, IterableDataset, IterableDatasetDict
+from datasets import load_dataset, Dataset, DatasetDict, IterableDataset, IterableDatasetDict, load_dataset_builder
 from dotenv import load_dotenv,find_dotenv
 import os
 import random
@@ -198,20 +198,25 @@ def stream_filtered_splits_to_hub(
                 yield row_dict
                 
         g_con.close()
-
-    # 4. Construct lazy Iterable Datasets and stream directly to the Hub
-    splits = {"train": train_set, "validation": val_set, "test": test_set}
+    try:
+        ds_builder = load_dataset_builder(path, token=hf_token)
+        repo_features = ds_builder.info.features
+        logger.info(f"Successfully captured dataset schema features.")
+    except Exception as e:
+        logger.warning(f"Could not automatically resolve remote features schema: {e}. Defaulting to None.")
+        repo_features = None
+        # 4. Construct lazy Iterable Datasets and stream directly to the Hub
+        splits = {"train": train_set, "validation": val_set, "test": test_set}
     
     for split_label, index_target in splits.items():
         logger.info(f"Streaming data channel directly to target repository split: '{split_label}'...")
         
-        # Initialize as a generator-based iterable stream
         lazy_iterable = IterableDataset.from_generator(
             make_split_generator, 
-            gen_kwargs={"target_set": index_target}
+            gen_kwargs={"target_set": index_target},
+            features=repo_features # 2. Pass the schema here!
         )
         
-        # Pushes to the Hugging Face hub row-by-row via HTTP chunks
         lazy_iterable.push_to_hub(
             repo_id=target_repo_id,
             split=split_label,
