@@ -92,10 +92,34 @@ def load_hf_dataset(
         raise e
 
 
+# --- THE PICKLE FIX: GLOBAL REGISTRY ---
+# Storing active connections here by string keys allows Hugging Face to process 
+# generator arguments cleanly without attempting to serialize live C++ connections.
+_ACTIVE_DUCKDB_CONNECTIONS = {}
 
+def _global_split_generator(target_set: set, connection_key: str) -> Generator[Dict[str, Any], None, None]:
+    """
+    Global-scope generator function accessed by Hugging Face streaming workers.
+    Looks up the unpicklable DuckDB connection safely via a string reference key.
+    """
+    active_con = _ACTIVE_DUCKDB_CONNECTIONS.get(connection_key)
+    if active_con is None:
+        raise RuntimeError(f"DuckDB connection context for key '{connection_key}' was lost or closed.")
+        
+    result_cursor = active_con.execute("SELECT * FROM filtered_source;")
+    column_names = [desc[0] for desc in result_cursor.description]
+    
+    while True:
+        row = result_cursor.fetchone()
+        if row is None:
+            break
+            
+        row_dict = dict(zip(column_names, row))
+        current_idx = row_dict.pop("__row_index") # Remove tracking index column
+        
+        if current_idx in target_set:
+            yield row_dict
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def stream_filtered_splits_to_hub(
     path: str,
@@ -116,6 +140,7 @@ def stream_filtered_splits_to_hub(
     if not hf_token:
         raise ValueError("A valid Hugging Face Write Token must be present to push datasets to the Hub.")
 
+    # Core repository instantiation
     HfApi().create_repo(repo_id=target_repo_id, token=hf_token, repo_type="dataset", private=private, exist_ok=True)
 
     # 1. Open a local DuckDB session and throttle network aggressiveness to prevent 429s
@@ -124,11 +149,14 @@ def stream_filtered_splits_to_hub(
     con.execute("LOAD httpfs;")
     con.execute(f"CREATE OR REPLACE SECRET hf_secret (TYPE huggingface, TOKEN '{hf_token}');")
     
-    # --- THE ANTI-429 FIX FOR DUCKDB ---
     # Throttle DuckDB so it doesn't slam Hugging Face with parallel requests
-    con.execute("SET threads=2;")       # Reduce from default (substantially lower concurrency)
-    con.execute("SET http_retries=1000;")             # Force automatic exponential backoff on 429/503 errors
-    con.execute("SET http_retry_backoff=4.0;")        # Wait longer between retries
+    con.execute("SET threads=2;")                       # Reduce from default (substantially lower concurrency)
+    con.execute("SET http_retries=1000;")               # Force automatic exponential backoff on 429/503 errors
+    con.execute("SET http_retry_backoff=4.0;")          # Wait longer between retries
+    
+    # Generate a unique key for this connection lifecycle string mapping
+    connection_key = f"{path.replace('/', '_')}_{seed}_{random.randint(0, 100000)}"
+    _ACTIVE_DUCKDB_CONNECTIONS[connection_key] = con
     
     # Target the precise default parquet directory instead of scanning everything via global wildcards
     hf_parquet_url = f"hf://datasets/{path}@~parquet/default/{split_name}/*.parquet"
@@ -154,12 +182,15 @@ def stream_filtered_splits_to_hub(
         con.execute(f"CREATE OR REPLACE VIEW filtered_source AS {query}")
         total_len = con.execute("SELECT COUNT(*) FROM filtered_source;").fetchone()[0]
     except Exception as e:
+        # Cleanup registry state immediately on validation failure
+        _ACTIVE_DUCKDB_CONNECTIONS.pop(connection_key, None)
         logger.error(f"DuckDB remote view creation failed: {e}")
         raise e
 
     logger.info(f"Identified {total_len} matching records. Computing partition allocations...")
 
     if total_len == 0:
+        _ACTIVE_DUCKDB_CONNECTIONS.pop(connection_key, None)
         raise ValueError(f"No rows matched filter criteria {filter_dict} in dataset {path}.")
 
     # 2. Derive randomized index splits
@@ -175,26 +206,7 @@ def stream_filtered_splits_to_hub(
     val_set = set(chosen_indices[train_size:train_size + val_size])
     test_set = set(chosen_indices[train_size + val_size:])
 
-    # 3. Modify the generator factory to accept the active connection object
-    def make_split_generator(target_set: set, active_con) -> Generator[Dict[str, Any], None, None]:
-        """
-        Inner generator function that reads rows individually using the outer 
-        connection context that actually holds the view definition.
-        """
-        # CRITICAL: Execute directly on the existing connection that holds the view
-        result_cursor = active_con.execute("SELECT * FROM filtered_source;")
-        column_names = [desc[0] for desc in result_cursor.description]
-        
-        while True:
-            row = result_cursor.fetchone()
-            if row is None:
-                break
-            
-            row_dict = dict(zip(column_names, row))
-            current_idx = row_dict.pop("__row_index") # Strip synthetic sequence key
-            
-            if current_idx in target_set:
-                yield row_dict
+    # Fetch configuration features schema cleanly to assist serializer formatting
     try:
         ds_builder = load_dataset_builder(path, token=hf_token)
         repo_features = ds_builder.info.features
@@ -202,7 +214,8 @@ def stream_filtered_splits_to_hub(
     except Exception as e:
         logger.warning(f"Could not automatically resolve remote features schema: {e}. Defaulting to None.")
         repo_features = None
-    # 4. Construct lazy datasets passing 'con' inside gen_kwargs
+
+    # 4. Construct unmaterialized streaming pipelines passing picklable identifiers
     splits = {"train": train_set, "validation": val_set, "test": test_set}
     
     for split_label, index_target in splits.items():
@@ -211,15 +224,14 @@ def stream_filtered_splits_to_hub(
             
         logger.info(f"Streaming data channel directly to target repository split: '{split_label}'...")
         
-        # We switch to Dataset.from_generator for zero-disk batching
-        batched_dataset = Dataset.from_generator(
-            make_split_generator, 
-            gen_kwargs={"target_set": index_target, "active_con": con}, # <-- Pass connection here!
-            features=repo_features,
-            writer_batch_size=5000
+        # Purely lazy streaming setup. gen_kwargs handles only native primitives (set and str)
+        lazy_dataset = IterableDataset.from_generator(
+            _global_split_generator, 
+            gen_kwargs={"target_set": index_target, "connection_key": connection_key},
+            features=repo_features
         )
         
-        batched_dataset.push_to_hub(
+        lazy_dataset.push_to_hub(
             repo_id=target_repo_id,
             split=split_label,
             token=hf_token,
@@ -227,4 +239,7 @@ def stream_filtered_splits_to_hub(
         )
         
     logger.info(f"Pipeline complete! Splits successfully streamed to https://huggingface.co/datasets/{target_repo_id}")
+    
+    # Clean closing handles to release environment resources cleanly
     con.close()
+    _ACTIVE_DUCKDB_CONNECTIONS.pop(connection_key, None)
