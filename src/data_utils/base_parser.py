@@ -126,7 +126,7 @@ def stream_filtered_splits_to_hub(
     
     # --- THE ANTI-429 FIX FOR DUCKDB ---
     # Throttle DuckDB so it doesn't slam Hugging Face with parallel requests
-    con.execute("SET max_http_connections=2;")       # Reduce from default (substantially lower concurrency)
+    con.execute("SET threads=2;")       # Reduce from default (substantially lower concurrency)
     con.execute("SET http_retries=10;")                # Force automatic exponential backoff on 429/503 errors
     con.execute("SET http_retry_backoff=2.0;")        # Wait longer between retries
     
