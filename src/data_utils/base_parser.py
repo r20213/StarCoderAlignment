@@ -209,8 +209,8 @@ def stream_filtered_splits_to_hub(
     except Exception as e:
         logger.warning(f"Could not automatically resolve remote features schema: {e}. Defaulting to None.")
         repo_features = None
-        # 4. Construct lazy Iterable Datasets and stream directly to the Hub
-        splits = {"train": train_set, "validation": val_set, "test": test_set}
+    # 4. Construct lazy Iterable Datasets and stream directly to the Hub
+    splits = {"train": train_set, "validation": val_set, "test": test_set}
     
     for split_label, index_target in splits.items():
         logger.info(f"Streaming data channel directly to target repository split: '{split_label}'...")
