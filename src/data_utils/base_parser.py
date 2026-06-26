@@ -124,7 +124,7 @@ def stream_filtered_splits_to_hub(
     con.execute("LOAD httpfs;")
     con.execute(f"CREATE OR REPLACE SECRET hf_secret (TYPE huggingface, TOKEN '{hf_token}');")
     
-    hf_parquet_url = f"hf://datasets/{path}@~parquet/**/*.{split_name}.parquet"
+    hf_parquet_url = f"hf://datasets/{path}@~parquet/**/*.parquet"
     
     # Compile constraints matching filter_dict
     where_clauses = []
