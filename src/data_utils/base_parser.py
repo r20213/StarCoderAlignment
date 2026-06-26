@@ -1,5 +1,5 @@
 import logging
-from datasets import load_dataset, Dataset, DatasetDict, IterableDataset, IterableDatasetDict, load_dataset_builder
+from datasets import load_dataset, Dataset, DatasetDict, IterableDataset, IterableDatasetDict, load_dataset_builder, SplitDict, SplitInfo
 from dotenv import load_dotenv,find_dotenv
 import os
 import random
@@ -194,7 +194,9 @@ def stream_filtered_splits_to_hub(
             },
             features=repo_features
         )
-        
+        lazy_dataset.info.splits = SplitDict({
+            split_label: SplitInfo(name=split_label, num_examples=len(index_target))
+        })
         lazy_dataset.push_to_hub(repo_id=target_repo_id, split=split_label, token=hf_token, private=private)
         
     logger.info(f"Pipeline complete! Splits successfully streamed to https://huggingface.co/datasets/{target_repo_id}")
