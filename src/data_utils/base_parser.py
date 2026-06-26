@@ -11,6 +11,15 @@ from huggingface_hub import HfApi
 load_dotenv(find_dotenv())  # Load environment variables from .env file if present
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# Monkey patch IterableDataset to support a user-provided length
+def _iterable_dataset_len(self):
+    if hasattr(self, "_known_length"):
+        return self._known_length
+    raise TypeError("object of type 'IterableDataset' has no len()")
+
+# Only patch once
+if not hasattr(IterableDataset, "__len__"):
+    IterableDataset.__len__ = _iterable_dataset_len
 
 def row_filter_logic(example, filter_dict: Dict[str, Any]) -> bool:
     for col, target_val in filter_dict.items():
@@ -194,9 +203,7 @@ def stream_filtered_splits_to_hub(
             },
             features=repo_features
         )
-        lazy_dataset.info.splits = SplitDict({
-            split_label: SplitInfo(name=split_label, num_examples=len(index_target))
-        })
+        lazy_dataset._known_length = len(index_target)
         lazy_dataset.push_to_hub(repo_id=target_repo_id, split=split_label, token=hf_token, private=private)
         
     logger.info(f"Pipeline complete! Splits successfully streamed to https://huggingface.co/datasets/{target_repo_id}")
