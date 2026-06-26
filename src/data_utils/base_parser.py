@@ -127,8 +127,8 @@ def stream_filtered_splits_to_hub(
     # --- THE ANTI-429 FIX FOR DUCKDB ---
     # Throttle DuckDB so it doesn't slam Hugging Face with parallel requests
     con.execute("SET threads=2;")       # Reduce from default (substantially lower concurrency)
-    con.execute("SET http_retries=10;")                # Force automatic exponential backoff on 429/503 errors
-    con.execute("SET http_retry_backoff=2.0;")        # Wait longer between retries
+    con.execute("SET http_retries=1000;")             # Force automatic exponential backoff on 429/503 errors
+    con.execute("SET http_retry_backoff=4.0;")        # Wait longer between retries
     
     # Target the precise default parquet directory instead of scanning everything via global wildcards
     hf_parquet_url = f"hf://datasets/{path}@~parquet/default/{split_name}/*.parquet"
