@@ -2,6 +2,9 @@ import logging
 from typing import Optional, Union, Dict, Any
 from datasets import load_dataset, Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from dotenv import load_dotenv,find_dotenv
+import os
+import requests
+import logging
 
 load_dotenv(find_dotenv())  # Load environment variables from .env file if present
 logging.basicConfig(level=logging.INFO)
@@ -85,3 +88,32 @@ def load_hf_dataset(
     except Exception as e:
         logger.error(f"Failed to process dataset pipeline for '{path}'. Details: {e}")
         raise e
+
+
+def get_dataset_length_via_duckdb(path: str, split: str = "train", token: Optional[str] = None) -> int:
+    """
+    Queries Hugging Face's DuckDB Serverless SQL endpoint to instantly 
+    retrieve the row count without downloading or iterating through the dataset.
+    """
+    # Fallback to env token if not explicitly provided
+    hf_token = token or os.getenv("HF_TOKEN")
+    
+    # URL encoded query targeting the dataset path
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    url = f"https://datasets-server.huggingface.co/sql?dataset={path}&query=SELECT COUNT(*) FROM {split}"
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # The API returns a structure like: {"rows": [[35700]], "features": [...]}
+            if "rows" in data and len(data["rows"]) > 0:
+                total_rows = data["rows"][0][0]
+                logger.info(f"DuckDB Query Success: '{path}' [{split}] has {total_rows} rows.")
+                return int(total_rows)
+        
+        logger.warning(f"DuckDB API unavailable or failed (Status: {response.status_code}).")
+    except Exception as e:
+        logger.warning(f"Failed to query DuckDB server: {e}. Falling back to standard counting.")
+        
+    return -1
