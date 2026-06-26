@@ -4,7 +4,7 @@ from dotenv import load_dotenv,find_dotenv
 import os
 import random
 import duckdb
-from typing import Optional, Dict, Any, Generator
+from typing import Optional, Dict, Any, Generator,Union
 from huggingface_hub import HfApi
 
 
