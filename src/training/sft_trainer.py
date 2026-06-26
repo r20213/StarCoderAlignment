@@ -29,7 +29,7 @@ class TrainConfig:
     model_id: str = "your-base-model-id"
     output_dir: str = "./muon_sft_model"
 
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
     per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 4
     grad_accum_steps: int = 4
@@ -284,9 +284,12 @@ def build_sft_examples(tokenizer, dataset, cfg, count: int | None = None) -> Lis
     # TODO : Replace this with your real preprocessing logic to load and tokenize your SFT dataset.
     examples = []
     total_count = count if count is not None else len(dataset)
+    eos = tokenizer.eos_token_id
     for i in range(total_count):
         prompt = dataset[i][cfg.dataset_prompt_field]
         response = dataset[i][cfg.dataset_response_field]
+        if len(response_ids) == 0 or response_ids[-1] != eos:
+            response_ids = response_ids + [eos]
 
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
