@@ -92,33 +92,26 @@ def load_hf_dataset(
         raise e
 
 
-# --- THE PICKLE FIX: GLOBAL REGISTRY ---
-# Storing active connections here by string keys allows Hugging Face to process 
-# generator arguments cleanly without attempting to serialize live C++ connections.
-_ACTIVE_DUCKDB_CONNECTIONS = {}
-
-def _global_split_generator(target_set: set, connection_key: str) -> Generator[Dict[str, Any], None, None]:
+def _hf_stream_generator(
+    path: str, 
+    split_name: str, 
+    filter_dict: Optional[Dict[str, Any]], 
+    target_set: set, 
+    token: str
+) -> Generator[Dict[str, Any], None, None]:
     """
-    Global-scope generator function accessed by Hugging Face streaming workers.
-    Looks up the unpicklable DuckDB connection safely via a string reference key.
+    Leverages the custom load_hf_dataset utility to stream pre-filtered rows,
+    yielding only the indices allocated to this specific split partition.
     """
-    active_con = _ACTIVE_DUCKDB_CONNECTIONS.get(connection_key)
-    if active_con is None:
-        raise RuntimeError(f"DuckDB connection context for key '{connection_key}' was lost or closed.")
-        
-    result_cursor = active_con.execute("SELECT * FROM filtered_source;")
-    column_names = [desc[0] for desc in result_cursor.description]
+    # Reuse your custom utility function directly!
+    filtered_stream = load_hf_dataset(
+        path=path, split=split_name, streaming=True, token=token, filter_dict=filter_dict
+    )
     
-    while True:
-        row = result_cursor.fetchone()
-        if row is None:
-            break
-            
-        row_dict = dict(zip(column_names, row))
-        current_idx = row_dict.pop("__row_index") # Remove tracking index column
-        
-        if current_idx in target_set:
-            yield row_dict
+    # Track the matching rows as they stream through
+    for idx, row in enumerate(filtered_stream):
+        if idx in target_set:
+            yield row
 
 
 def stream_filtered_splits_to_hub(
@@ -132,114 +125,76 @@ def stream_filtered_splits_to_hub(
     private: bool = True
 ) -> None:
     """
-    Queries Hugging Face dataset via local DuckDB, calculates exact split partitions, 
-    and pipes data directly to the Hub via lazy stream generators without local materialization.
+    Uses DuckDB solely for a lightweight remote COUNT(*) query, then pipes 
+    unmaterialized data splits to the Hub using your custom load_hf_dataset stream.
     """
     random.seed(seed)
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         raise ValueError("A valid Hugging Face Write Token must be present to push datasets to the Hub.")
 
-    # Core repository instantiation
     HfApi().create_repo(repo_id=target_repo_id, token=hf_token, repo_type="dataset", private=private, exist_ok=True)
 
-    # 1. Open a local DuckDB session and throttle network aggressiveness to prevent 429s
+    # 1. Quick DuckDB execution strictly to grab the filtered total length
     con = duckdb.connect()
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
+    con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute(f"CREATE OR REPLACE SECRET hf_secret (TYPE huggingface, TOKEN '{hf_token}');")
+    con.execute("SET threads=2; SET http_retries=10;")
     
-    # Throttle DuckDB so it doesn't slam Hugging Face with parallel requests
-    con.execute("SET threads=2;")                       # Reduce from default (substantially lower concurrency)
-    con.execute("SET http_retries=1000;")               # Force automatic exponential backoff on 429/503 errors
-    con.execute("SET http_retry_backoff=4.0;")          # Wait longer between retries
-    
-    # Generate a unique key for this connection lifecycle string mapping
-    connection_key = f"{path.replace('/', '_')}_{seed}_{random.randint(0, 100000)}"
-    _ACTIVE_DUCKDB_CONNECTIONS[connection_key] = con
-    
-    # Target the precise default parquet directory instead of scanning everything via global wildcards
     hf_parquet_url = f"hf://datasets/{path}@~parquet/default/{split_name}/*.parquet"
     
-    # Compile constraints matching filter_dict
     where_clauses = []
     if filter_dict:
         for col, val in filter_dict.items():
-            if isinstance(val, str):
-                where_clauses.append(f"LOWER({col}) LIKE '%{val.lower()}%'")
-            else:
-                where_clauses.append(f"{col} = {val}")
+            where_clauses.append(f"LOWER({col}) LIKE '%{val.lower()}%'" if isinstance(val, str) else f"{col} = {val}")
     where_stmt = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     
-    query = f"""
-        SELECT *, ROW_NUMBER() OVER() - 1 as __row_index 
-        FROM '{hf_parquet_url}' 
-        {where_stmt};
-    """
-    
-    logger.info(f"Analyzing and isolating row schemas remotely via DuckDB (throttled mode)...")
+    logger.info("Querying remote dataset length via DuckDB...")
     try:
-        con.execute(f"CREATE OR REPLACE VIEW filtered_source AS {query}")
-        total_len = con.execute("SELECT COUNT(*) FROM filtered_source;").fetchone()[0]
-    except Exception as e:
-        # Cleanup registry state immediately on validation failure
-        _ACTIVE_DUCKDB_CONNECTIONS.pop(connection_key, None)
-        logger.error(f"DuckDB remote view creation failed: {e}")
-        raise e
-
-    logger.info(f"Identified {total_len} matching records. Computing partition allocations...")
+        total_len = con.execute(f"SELECT COUNT(*) FROM '{hf_parquet_url}' {where_stmt};").fetchone()[0]
+    finally:
+        con.close() # Instantly close connection
 
     if total_len == 0:
-        _ACTIVE_DUCKDB_CONNECTIONS.pop(connection_key, None)
         raise ValueError(f"No rows matched filter criteria {filter_dict} in dataset {path}.")
 
     # 2. Derive randomized index splits
     subset_size = int(total_len * sample_percentage)
     train_size = int(subset_size * train_ratio)
-    remaining_size = subset_size - train_size
-    val_size = remaining_size // 2
+    val_size = (subset_size - train_size) // 2
     
-    all_indices = list(range(total_len))
-    chosen_indices = random.sample(all_indices, subset_size)
-    
-    train_set = set(chosen_indices[:train_size])
-    val_set = set(chosen_indices[train_size:train_size + val_size])
-    test_set = set(chosen_indices[train_size + val_size:])
+    chosen_indices = random.sample(range(total_len), subset_size)
+    splits = {
+        "train": set(chosen_indices[:train_size]),
+        "validation": set(chosen_indices[train_size:train_size + val_size]),
+        "test": set(chosen_indices[train_size + val_size:])
+    }
 
-    # Fetch configuration features schema cleanly to assist serializer formatting
+    # Extract schema features to preserve target formats
     try:
-        ds_builder = load_dataset_builder(path, token=hf_token)
-        repo_features = ds_builder.info.features
-        logger.info(f"Successfully captured dataset schema features.")
-    except Exception as e:
-        logger.warning(f"Could not automatically resolve remote features schema: {e}. Defaulting to None.")
+        repo_features = load_dataset_builder(path, token=hf_token).info.features
+    except Exception:
         repo_features = None
 
-    # 4. Construct unmaterialized streaming pipelines passing picklable identifiers
-    splits = {"train": train_set, "validation": val_set, "test": test_set}
-    
+    # 3. Stream each split channel straight to the Hub
     for split_label, index_target in splits.items():
         if len(index_target) == 0:
             continue
             
         logger.info(f"Streaming data channel directly to target repository split: '{split_label}'...")
         
-        # Purely lazy streaming setup. gen_kwargs handles only native primitives (set and str)
         lazy_dataset = IterableDataset.from_generator(
-            _global_split_generator, 
-            gen_kwargs={"target_set": index_target, "connection_key": connection_key},
+            _hf_stream_generator, 
+            gen_kwargs={
+                "path": path,
+                "split_name": split_name,
+                "filter_dict": filter_dict,
+                "target_set": index_target,
+                "token": hf_token
+            },
             features=repo_features
         )
         
-        lazy_dataset.push_to_hub(
-            repo_id=target_repo_id,
-            split=split_label,
-            token=hf_token,
-            private=private
-        )
+        lazy_dataset.push_to_hub(repo_id=target_repo_id, split=split_label, token=hf_token, private=private)
         
     logger.info(f"Pipeline complete! Splits successfully streamed to https://huggingface.co/datasets/{target_repo_id}")
-    
-    # Clean closing handles to release environment resources cleanly
-    con.close()
-    _ACTIVE_DUCKDB_CONNECTIONS.pop(connection_key, None)
