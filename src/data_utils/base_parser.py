@@ -1,7 +1,9 @@
 import logging
 from typing import Optional, Union, Dict, Any
 from datasets import load_dataset, Dataset, DatasetDict, IterableDataset, IterableDatasetDict
+from python_dotenv import load_dotenv
 
+load_dotenv()  # Load environment variables from .env file if present
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
