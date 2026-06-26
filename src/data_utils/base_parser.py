@@ -118,13 +118,20 @@ def stream_filtered_splits_to_hub(
 
     HfApi().create_repo(repo_id=target_repo_id, token=hf_token, repo_type="dataset", private=private, exist_ok=True)
 
-    # 1. Open a local DuckDB session to grab the filtered indices
+    # 1. Open a local DuckDB session and throttle network aggressiveness to prevent 429s
     con = duckdb.connect()
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
     con.execute(f"CREATE OR REPLACE SECRET hf_secret (TYPE huggingface, TOKEN '{hf_token}');")
     
-    hf_parquet_url = f"hf://datasets/{path}@~parquet/**/*.parquet"
+    # --- THE ANTI-429 FIX FOR DUCKDB ---
+    # Throttle DuckDB so it doesn't slam Hugging Face with parallel requests
+    con.execute("SET max_http_connections=2;")       # Reduce from default (substantially lower concurrency)
+    con.execute("SET http_retries=10;")                # Force automatic exponential backoff on 429/503 errors
+    con.execute("SET http_retry_backoff=2.0;")        # Wait longer between retries
+    
+    # Target the precise default parquet directory instead of scanning everything via global wildcards
+    hf_parquet_url = f"hf://datasets/{path}@~parquet/default/{split_name}/*.parquet"
     
     # Compile constraints matching filter_dict
     where_clauses = []
@@ -136,17 +143,14 @@ def stream_filtered_splits_to_hub(
                 where_clauses.append(f"{col} = {val}")
     where_stmt = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     
-    # Query to fetch all rows matching the criteria along with a synthetic sequence tracker
-    # ROW_NUMBER ensures we can dynamically map our randomized offsets over stream conditions
     query = f"""
         SELECT *, ROW_NUMBER() OVER() - 1 as __row_index 
         FROM '{hf_parquet_url}' 
         {where_stmt};
     """
     
-    logger.info(f"Analyzing and isolating row schemas remotely via DuckDB...")
+    logger.info(f"Analyzing and isolating row schemas remotely via DuckDB (throttled mode)...")
     try:
-        # Create a temporary local View instead of pulling data blocks
         con.execute(f"CREATE OR REPLACE VIEW filtered_source AS {query}")
         total_len = con.execute("SELECT COUNT(*) FROM filtered_source;").fetchone()[0]
     except Exception as e:
