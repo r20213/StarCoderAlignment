@@ -175,19 +175,14 @@ def stream_filtered_splits_to_hub(
     val_set = set(chosen_indices[train_size:train_size + val_size])
     test_set = set(chosen_indices[train_size + val_size:])
 
-    # 3. Define the unmaterialized generator factory
-    def make_split_generator(target_set: set) -> Generator[Dict[str, Any], None, None]:
+    # 3. Modify the generator factory to accept the active connection object
+    def make_split_generator(target_set: set, active_con) -> Generator[Dict[str, Any], None, None]:
         """
-        Inner generator function that reads rows individually from the DuckDB view
-        and yields them instantly to the streaming uploader process.
+        Inner generator function that reads rows individually using the outer 
+        connection context that actually holds the view definition.
         """
-        # Open separate connection thread context for generator isolation
-        g_con = duckdb.connect()
-        g_con.execute("INSTALL httpfs; LOAD httpfs;")
-        g_con.execute(f"CREATE OR REPLACE SECRET hf_secret (TYPE huggingface, TOKEN '{hf_token}');")
-        
-        # Pull rows sequentially via stream cursor
-        result_cursor = g_con.execute("SELECT * FROM filtered_source;")
+        # CRITICAL: Execute directly on the existing connection that holds the view
+        result_cursor = active_con.execute("SELECT * FROM filtered_source;")
         column_names = [desc[0] for desc in result_cursor.description]
         
         while True:
@@ -196,12 +191,10 @@ def stream_filtered_splits_to_hub(
                 break
             
             row_dict = dict(zip(column_names, row))
-            current_idx = row_dict.pop("__row_index") # Strip our synthetic row key
+            current_idx = row_dict.pop("__row_index") # Strip synthetic sequence key
             
             if current_idx in target_set:
                 yield row_dict
-                
-        g_con.close()
     try:
         ds_builder = load_dataset_builder(path, token=hf_token)
         repo_features = ds_builder.info.features
@@ -209,19 +202,24 @@ def stream_filtered_splits_to_hub(
     except Exception as e:
         logger.warning(f"Could not automatically resolve remote features schema: {e}. Defaulting to None.")
         repo_features = None
-    # 4. Construct lazy Iterable Datasets and stream directly to the Hub
+    # 4. Construct lazy datasets passing 'con' inside gen_kwargs
     splits = {"train": train_set, "validation": val_set, "test": test_set}
     
     for split_label, index_target in splits.items():
+        if len(index_target) == 0:
+            continue
+            
         logger.info(f"Streaming data channel directly to target repository split: '{split_label}'...")
         
-        lazy_iterable = IterableDataset.from_generator(
+        # We switch to Dataset.from_generator for zero-disk batching
+        batched_dataset = Dataset.from_generator(
             make_split_generator, 
-            gen_kwargs={"target_set": index_target},
-            features=repo_features # 2. Pass the schema here!
+            gen_kwargs={"target_set": index_target, "active_con": con}, # <-- Pass connection here!
+            features=repo_features,
+            writer_batch_size=5000
         )
         
-        lazy_iterable.push_to_hub(
+        batched_dataset.push_to_hub(
             repo_id=target_repo_id,
             split=split_label,
             token=hf_token,
