@@ -1,3 +1,3 @@
-from base_parser import load_hf_dataset
+from .base_parser import load_hf_dataset
 
 __all__ = ["load_hf_dataset"]
