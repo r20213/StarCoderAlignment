@@ -375,7 +375,7 @@ def main():
     # -------------------------------------------------
     train_dataset = load_dataset(cfg.train_dataset_hub_id, split=cfg.train_dataset_split) if cfg.train_dataset_hub_id else None
     val_dataset = load_dataset(cfg.val_dataset_hub_id, split=cfg.val_dataset_split) if cfg.val_dataset_hub_id else None
-    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=100)
+    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=200)
     val_examples = build_sft_examples(tokenizer, val_dataset, cfg.val_dataset_prompt_field, cfg.val_dataset_response_field, count=10)
 
     train_dataset = PackedSFTDataset(
@@ -520,14 +520,15 @@ def main():
                 running_microbatches = 0
 
                 if is_main and optim_step % cfg.log_every_optimizer_step == 0:
-                    adamw_current_lr = lr * (cfg.adamw_base_lr / cfg.muon_base_lr)
+                    muon_current_lr = optimizer_muon.param_groups[0]["lr"]
+                    adamw_current_lr = optimizer_adamw.param_groups[0]["lr"]
                     logger.info(
                         f"epoch={epoch} step={optim_step}/{total_optim_steps} "
-                        f"muon_lr={lr:.6f} adamw_lr={adamw_current_lr:.8f} train_loss={train_loss:.4f}"
+                        f"muon_lr={muon_current_lr:.6f} adamw_lr={adamw_current_lr:.8f} train_loss={train_loss:.4f}"
                     )
                     wandb.log({
                         "train/loss": train_loss,
-                        "train/muon_lr": lr,
+                        "train/muon_lr": muon_current_lr,
                         "train/adamw_lr": adamw_current_lr,
                         "epoch": epoch,
                         "step": optim_step,
@@ -545,14 +546,14 @@ def main():
 
             if is_main:
                 # Calculate the exact current state of AdamW learning rate for the eval step log
-                adamw_current_lr = lr * (cfg.adamw_base_lr / cfg.muon_base_lr)
-                
+                adamw_current_lr = optimizer_adamw.param_groups[0]["lr"]
+                muon_current_lr = optimizer_muon.param_groups[0]["lr"]
                 logger.info(
                     f"epoch={epoch} step={optim_step}/{total_optim_steps} val_loss={val_loss:.4f}"
                 )
                 wandb.log({
                     "val/loss": val_loss,
-                    "val/muon_lr": lr,           # Added for clean tracking tracking
+                    "val/muon_lr": muon_current_lr,           # Added for clean tracking tracking
                     "val/adamw_lr": adamw_current_lr, # Added for clean tracking tracking
                     "epoch": epoch,
                     "step": optim_step,
