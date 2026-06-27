@@ -3,6 +3,7 @@ import math
 import logging
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
+from dotenv import find_dotenv, load_dotenv
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -20,13 +21,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+load_dotenv(find_dotenv())
 # =========================================================
 # CONFIG
 # =========================================================
 @dataclass
 class TrainConfig:
-    model_id: str = "your-base-model-id"
+    model_id: str = "bigcode/tiny_starcoder_py"
     output_dir: str = "./muon_sft_model"
 
     max_seq_len: int = 4096
@@ -35,7 +36,8 @@ class TrainConfig:
     grad_accum_steps: int = 4
     epochs: int = 3
 
-    lr: float = 2e-5
+    adamw_base_lr: float = 2e-5
+    muon_base_lr: float = 0.02 # Use the industry standard lr for Muon.
     weight_decay: float = 0.01
     betas: tuple = (0.9, 0.95)
     max_grad_norm: float = 1.0
@@ -50,19 +52,21 @@ class TrainConfig:
 
     hub_repo_id: Optional[str] = "LastTransformer/tinystarcoder-muon-sft-ddp"
     hub_private_repo: bool = False
-    hub_token: Optional[str] = None
+    hub_token: Optional[str] = os.getenv("HF_TOKEN")
 
     eval_at_epoch_end: bool = True
     log_every_optimizer_step: int = 1
 
     bf16: bool = False  # set True if your GPUs support bf16
     fp16: bool = True   # default AMP mode
-    train_dataset_hub_id: Optional[str] = None  # if you have a dataset on the hub, specify it here
+    train_dataset_hub_id: Optional[str] = "LastTransformer/m-a-p-CodeFeedback-Filtered-Instruction-Splits"  # if you have a dataset on the hub, specify it here
     train_dataset_split: str = "train"
-    val_dataset_hub_id: Optional[str] = None  # if you have a dataset on the hub, specify it here
+    val_dataset_hub_id: Optional[str] = "LastTransformer/m-a-p-CodeFeedback-Filtered-Instruction-Splits"  # if you have a dataset on the hub, specify it here
     val_dataset_split: str = "validation"
-    dataset_prompt_field: str = "query"
-    dataset_response_field: str = "answer"
+    train_dataset_prompt_field: str = "query"
+    train_dataset_response_field: str = "answer"
+    val_dataset_prompt_field: str = "query"
+    val_dataset_response_field: str = "answer"
 
 
 
@@ -189,20 +193,29 @@ def sft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 # =========================================================
 # 4. PARAM GROUPING FOR MUON
 # =========================================================
+
 def build_muon_param_groups(model: torch.nn.Module):
-    # TODO : Fix this to ensure that only the intended params are targeted by their exact names. Names like "embed" or "head" may appear in other contexts.
+    """
+    Groups parameters for Muon and an auxiliary optimizer (like AdamW).
+    
+    Targeted Muon parameters must be exactly 2D and exclude structural 
+    embeddings (transformer.wte.weight, transformer.wpe.weight). 
+    """
     muon_params = []
     aux_adam_params = []
+
+    # Exact names of 2D parameters to exclude from Muon optimization
+    excluded_names = {
+        "transformer.wte.weight",
+        "transformer.wpe.weight"
+    }
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
 
-        # Filter out embeddings and LM heads, even though they are 2D
-        is_embedding = "embed" in name or "wte" in name
-        is_lm_head = "lm_head" in name or "head" in name
-
-        if p.ndim == 2 and not (is_embedding or is_lm_head):
+        # Check if the parameter satisfies the 2D requirement and isn't an embedding
+        if p.ndim == 2 and name not in excluded_names:
             muon_params.append(p)
         else:
             aux_adam_params.append(p)
@@ -227,14 +240,26 @@ def get_cosine_warmup_lr(step: int, total_steps: int, warmup_steps: int, base_lr
     return min_lr + (base_lr - min_lr) * cosine
 
 
-def set_optimizer_lrs(optimizer, lr: float):
+def set_optimizer_lrs(optimizer, lr: float, cfg : TrainConfig):
+    """
+    Safely adjusts the learning rates over time.
+    'lr' coming from the scheduler acts as Muon's active learning rate.
+    """
     for group in optimizer.param_groups:
         if group.get("use_muon", False):
+            # Muon parameters are directly scaled by the scheduler's 'lr'
             group["lr"] = lr
+            
+            # Dynamically scale the nested/auxiliary AdamW parameters
+            if "adamw_lr" in group and "adamw_lr_ratio" in group:
+                group["adamw_lr"] = lr * group["adamw_lr_ratio"]
         else:
-            group["lr"] = lr
-            if "adamw_lr" in group:
-                group["adamw_lr"] = lr
+            # Standalone AdamW parameters (biases, layernorms)
+            # Since the incoming 'lr' is scaled for Muon (~0.02), we need to step 
+            # down this group to AdamW levels using the approximate ratio (~1/1000x)
+            # If your custom optimizer saves 'adamw_lr_ratio' globally, use that here too!
+            muon_to_adamw_ratio = cfg.adamw_base_lr / cfg.muon_base_lr
+            group["lr"] = lr * muon_to_adamw_ratio
 
 
 # =========================================================
@@ -405,15 +430,22 @@ def main():
     muon_params, aux_adam_params = build_muon_param_groups(ddp_model.module)
 
     optimizer = MuonWithAuxAdam(
-        [
-            {"params": muon_params, "use_muon": True},
-            {"params": aux_adam_params, "use_muon": False},
-        ],
-        lr=cfg.lr,
-        adamw_lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-        betas=cfg.betas,
-    )
+    [
+        {
+            "params": muon_params, 
+            "use_muon": True, 
+            "adamw_lr_ratio": cfg.adamw_base_lr / cfg.muon_base_lr
+        },
+        {
+            "params": aux_adam_params, 
+            "use_muon": False
+        },
+    ],
+    lr=cfg.muon_base_lr,
+    adamw_lr=cfg.adamw_base_lr,
+    weight_decay=cfg.weight_decay,
+    betas=cfg.betas,
+)
 
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.fp16)
 
@@ -458,10 +490,10 @@ def main():
                     step=optim_step,
                     total_steps=total_optim_steps,
                     warmup_steps=cfg.warmup_steps,
-                    base_lr=cfg.lr,
+                    base_lr=cfg.muon_base_lr,
                     min_lr_ratio=cfg.min_lr_ratio,
                 )
-                set_optimizer_lrs(optimizer, lr)
+                set_optimizer_lrs(optimizer, lr, cfg)
 
                 if cfg.fp16:
                     scaler.unscale_(optimizer)
@@ -482,13 +514,15 @@ def main():
                 running_microbatches = 0
 
                 if is_main and optim_step % cfg.log_every_optimizer_step == 0:
+                    adamw_current_lr = lr * (cfg.adamw_base_lr / cfg.muon_base_lr)
                     logger.info(
                         f"epoch={epoch} step={optim_step}/{total_optim_steps} "
-                        f"lr={lr:.8f} train_loss={train_loss:.4f}"
+                        f"muon_lr={lr:.6f} adamw_lr={adamw_current_lr:.8f} train_loss={train_loss:.4f}"
                     )
                     wandb.log({
                         "train/loss": train_loss,
-                        "train/lr": lr,
+                        "train/muon_lr": lr,
+                        "train/adamw_lr": adamw_current_lr,
                         "epoch": epoch,
                         "step": optim_step,
                     })
@@ -504,11 +538,16 @@ def main():
             )
 
             if is_main:
+                # Calculate the exact current state of AdamW learning rate for the eval step log
+                adamw_current_lr = lr * (cfg.adamw_base_lr / cfg.muon_base_lr)
+                
                 logger.info(
                     f"epoch={epoch} step={optim_step}/{total_optim_steps} val_loss={val_loss:.4f}"
                 )
                 wandb.log({
                     "val/loss": val_loss,
+                    "val/muon_lr": lr,           # Added for clean tracking tracking
+                    "val/adamw_lr": adamw_current_lr, # Added for clean tracking tracking
                     "epoch": epoch,
                     "step": optim_step,
                 })
