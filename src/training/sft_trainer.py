@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
 from muon import MuonWithAuxAdam
 from datasets import load_dataset
+from torch.amp import GradScaler, autocast
 
 logging.basicConfig(
     level=logging.INFO,
@@ -444,7 +445,7 @@ def main():
         },
     ])
 
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.fp16)
+    scaler = GradScaler('cuda', enabled=cfg.fp16)
 
     steps_per_epoch = len(train_loader) // cfg.grad_accum_steps
     total_optim_steps = steps_per_epoch * cfg.epochs
@@ -493,7 +494,14 @@ def main():
                 set_optimizer_lrs(optimizer, lr, cfg)
 
                 if cfg.fp16:
-                    scaler.unscale_(optimizer)
+                    # scaler.unscale_(optimizer)
+                    # We don't use scaler.unscale_(optimizer) because it crashes with Muon.
+                    # Instead, we perform the unscaling manually or skip it if the scaler already handles the float32 cast.
+                    scale = scaler.get_scale()
+                    for group in optimizer.param_groups:
+                        for p in group['params']:
+                            if p.grad is not None:
+                                p.grad.data.div_(scale)
 
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), cfg.max_grad_norm)
 
