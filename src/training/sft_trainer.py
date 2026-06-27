@@ -302,22 +302,23 @@ def evaluate(model, loader, local_rank, world_size, use_amp: bool, amp_dtype: to
 # 7. EXAMPLE DATA LOADING
 # =========================================================
 def build_sft_examples(tokenizer, dataset, dataset_prompt_field : str, dataset_response_field : str, count: int | None = None) -> List[Dict[str, Any]]:
-    """
-    Replace this with your real preprocessing.
-    Each example returns input_ids and labels where prompt tokens are masked with -100.
-    """
     examples = []
     total_count = count if count is not None else len(dataset)
     eos = tokenizer.eos_token_id
+    
     for i in range(total_count):
         prompt = dataset[i][dataset_prompt_field]
         response = dataset[i][dataset_response_field]
-        if len(response_ids) == 0 or response_ids[-1] != eos:
-            response_ids = response_ids + [eos]
 
+        # 1. Tokenize first
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
 
+        # 2. THEN perform the check on the defined variable
+        if len(response_ids) == 0 or response_ids[-1] != eos:
+            response_ids = response_ids + [eos]
+
+        # 3. Construct input_ids and labels
         input_ids = prompt_ids + response_ids
         labels = ([-100] * len(prompt_ids)) + response_ids
 
