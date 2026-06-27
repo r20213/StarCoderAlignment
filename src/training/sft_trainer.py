@@ -507,7 +507,9 @@ def main():
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), cfg.max_grad_norm)
 
                 if cfg.fp16:
-                    scaler.step(optimizer)
+                    # Use optimizer.step() directly instead of scaler.step()
+                    # to avoid the internal call to .unscale_() which will cause a crash.
+                    optimizer.step()
                     scaler.update()
                 else:
                     optimizer.step()
