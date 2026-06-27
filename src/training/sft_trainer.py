@@ -13,7 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
-from muon import MuonWithAuxAdam
+from torch.optim import Muon,AdamW
 from datasets import load_dataset
 from torch.amp import GradScaler, autocast
 
@@ -245,19 +245,20 @@ def get_cosine_warmup_lr(step: int, total_steps: int, warmup_steps: int, base_lr
     return min_lr + (base_lr - min_lr) * cosine
 
 
-def set_optimizer_lrs(optimizer, lr: float, cfg: TrainConfig):
+def set_optimizer_lrs(optimizer_muon, optimizer_adamw, lr: float, cfg: TrainConfig):
     """
-    Adjusts the learning rates for Muon and AdamW groups.
+    Adjusts the learning rates for Muon and AdamW optimizers independently.
     """
+    # 1. Update Muon
+    for group in optimizer_muon.param_groups:
+        group["lr"] = lr
+        
+    # 2. Update AdamW
     muon_to_adamw_ratio = cfg.adamw_base_lr / cfg.muon_base_lr
+    adamw_lr = lr * muon_to_adamw_ratio
     
-    for group in optimizer.param_groups:
-        if group.get("use_muon", False):
-            # Muon group
-            group["lr"] = lr
-        else:
-            # AdamW group
-            group["lr"] = lr * muon_to_adamw_ratio
+    for group in optimizer_adamw.param_groups:
+        group["lr"] = adamw_lr
 
 
 # =========================================================
@@ -428,23 +429,21 @@ def main():
     muon_params, aux_adam_params = build_muon_param_groups(ddp_model.module)
 
     # Define the groups with exactly the keys expected by your specific Muon implementation
-    optimizer = MuonWithAuxAdam([
-        {
-            "params": muon_params,
-            "use_muon": True,
-            "lr": cfg.muon_base_lr,
-            "momentum": cfg.muon_momentum,
-            "weight_decay": cfg.weight_decay,
-        },
-        {
-            "params": aux_adam_params,
-            "use_muon": False,
-            "lr": cfg.adamw_base_lr,
-            "betas": cfg.betas, # Only needed for the False branch
-            "eps": cfg.adamw_eps,       # Standard default for AdamW
-            "weight_decay": cfg.weight_decay,
-        },
-    ])
+    optimizer_muon = torch.optim.Muon(
+            muon_params, 
+            lr=cfg.muon_base_lr, 
+            momentum=cfg.muon_momentum, # Ensure your TrainConfig has these keys
+            weight_decay=cfg.weight_decay,
+            adjust_lr_fn="match_rms_adamw"
+        )
+
+    optimizer_adamw = torch.optim.AdamW(
+        aux_adam_params, 
+        lr=cfg.adamw_base_lr, 
+        weight_decay=cfg.weight_decay,
+        betas=cfg.betas,
+        eps=cfg.adamw_eps
+    )
 
     scaler = GradScaler('cuda', enabled=cfg.fp16)
 
@@ -452,7 +451,8 @@ def main():
     total_optim_steps = steps_per_epoch * cfg.epochs
     optim_step = 0
 
-    optimizer.zero_grad(set_to_none=True)
+    optimizer_muon.zero_grad(set_to_none=True)
+    optimizer_adamw.zero_grad(set_to_none=True)
 
     for epoch in range(cfg.epochs):
         train_sampler.set_epoch(epoch)
@@ -492,29 +492,24 @@ def main():
                     base_lr=cfg.muon_base_lr,
                     min_lr_ratio=cfg.min_lr_ratio,
                 )
-                set_optimizer_lrs(optimizer, lr, cfg)
+                set_optimizer_lrs(optimizer_muon, optimizer_adamw, lr, cfg)
 
                 if cfg.fp16:
-                    # scaler.unscale_(optimizer)
-                    # We don't use scaler.unscale_(optimizer) because it crashes with Muon.
-                    # Instead, we perform the unscaling manually or skip it if the scaler already handles the float32 cast.
-                    scale = scaler.get_scale()
-                    for group in optimizer.param_groups:
-                        for p in group['params']:
-                            if p.grad is not None:
-                                p.grad.data.div_(scale)
+                    scaler.unscale_(optimizer_muon)
+                    scaler.unscale_(optimizer_adamw)
 
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), cfg.max_grad_norm)
 
                 if cfg.fp16:
-                    # Use optimizer.step() directly instead of scaler.step()
-                    # to avoid the internal call to .unscale_() which will cause a crash.
-                    optimizer.step()
+                    scaler.step(optimizer_muon)
+                    scaler.step(optimizer_adamw)
                     scaler.update()
                 else:
-                    optimizer.step()
+                    optimizer_muon.step()
+                    optimizer_adamw.step()
 
-                optimizer.zero_grad(set_to_none=True)
+                optimizer_muon.zero_grad(set_to_none=True)
+                optimizer_adamw.zero_grad(set_to_none=True)
                 optim_step += 1
 
                 train_loss = running_loss / max(1, running_microbatches)
