@@ -306,7 +306,6 @@ def build_sft_examples(tokenizer, dataset, cfg, count: int | None = None) -> Lis
     Replace this with your real preprocessing.
     Each example returns input_ids and labels where prompt tokens are masked with -100.
     """
-    # TODO : Replace this with your real preprocessing logic to load and tokenize your SFT dataset.
     examples = []
     total_count = count if count is not None else len(dataset)
     eos = tokenizer.eos_token_id
