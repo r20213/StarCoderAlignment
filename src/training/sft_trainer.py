@@ -67,6 +67,8 @@ class TrainConfig:
     train_dataset_response_field: str = "answer"
     val_dataset_prompt_field: str = "query"
     val_dataset_response_field: str = "answer"
+    muon_momentum: float = 0.95  # Momentum for Muon optimizer
+    adamw_eps: float = 1e-10        # Epsilon for AdamW optimizer
 
 
 
@@ -240,25 +242,18 @@ def get_cosine_warmup_lr(step: int, total_steps: int, warmup_steps: int, base_lr
     return min_lr + (base_lr - min_lr) * cosine
 
 
-def set_optimizer_lrs(optimizer, lr: float, cfg : TrainConfig):
+def set_optimizer_lrs(optimizer, lr: float, cfg: TrainConfig):
     """
-    Safely adjusts the learning rates over time.
-    'lr' coming from the scheduler acts as Muon's active learning rate.
+    Adjusts the learning rates for Muon and AdamW groups.
     """
+    muon_to_adamw_ratio = cfg.adamw_base_lr / cfg.muon_base_lr
+    
     for group in optimizer.param_groups:
         if group.get("use_muon", False):
-            # Muon parameters are directly scaled by the scheduler's 'lr'
+            # Muon group
             group["lr"] = lr
-            
-            # Dynamically scale the nested/auxiliary AdamW parameters
-            if "adamw_lr" in group and "adamw_lr_ratio" in group:
-                group["adamw_lr"] = lr * group["adamw_lr_ratio"]
         else:
-            # Standalone AdamW parameters (biases, layernorms)
-            # Since the incoming 'lr' is scaled for Muon (~0.02), we need to step 
-            # down this group to AdamW levels using the approximate ratio (~1/1000x)
-            # If your custom optimizer saves 'adamw_lr_ratio' globally, use that here too!
-            muon_to_adamw_ratio = cfg.adamw_base_lr / cfg.muon_base_lr
+            # AdamW group
             group["lr"] = lr * muon_to_adamw_ratio
 
 
@@ -429,23 +424,24 @@ def main():
 
     muon_params, aux_adam_params = build_muon_param_groups(ddp_model.module)
 
-    optimizer = MuonWithAuxAdam(
-    [
+    # Define the groups with exactly the keys expected by your specific Muon implementation
+    optimizer = MuonWithAuxAdam([
         {
-            "params": muon_params, 
-            "use_muon": True, 
-            "adamw_lr_ratio": cfg.adamw_base_lr / cfg.muon_base_lr
+            "params": muon_params,
+            "use_muon": True,
+            "lr": cfg.muon_base_lr,
+            "momentum": cfg.muon_momentum,
+            "weight_decay": cfg.weight_decay,
         },
         {
-            "params": aux_adam_params, 
-            "use_muon": False
+            "params": aux_adam_params,
+            "use_muon": False,
+            "lr": cfg.adamw_base_lr,
+            "betas": cfg.betas, # Only needed for the False branch
+            "eps": cfg.adamw_eps,       # Standard default for AdamW
+            "weight_decay": cfg.weight_decay,
         },
-    ],
-    lr=cfg.muon_base_lr,
-    adamw_lr=cfg.adamw_base_lr,
-    weight_decay=cfg.weight_decay,
-    betas=cfg.betas,
-)
+    ])
 
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.fp16)
 
