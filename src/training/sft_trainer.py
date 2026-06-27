@@ -22,6 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv(find_dotenv())
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # =========================================================
 # CONFIG
 # =========================================================
@@ -31,9 +32,9 @@ class TrainConfig:
     output_dir: str = "./muon_sft_model"
 
     max_seq_len: int = 4096
-    per_device_train_batch_size: int = 4
-    per_device_eval_batch_size: int = 4
-    grad_accum_steps: int = 4
+    per_device_train_batch_size: int = 1
+    per_device_eval_batch_size: int = 1
+    grad_accum_steps: int = 16
     epochs: int = 3
 
     adamw_base_lr: float = 2e-5
