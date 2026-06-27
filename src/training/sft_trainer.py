@@ -354,7 +354,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_id,
-        torch_dtype=amp_dtype if use_amp else torch.float32,
+        dtype=amp_dtype if use_amp else torch.float32,
         attn_implementation="sdpa"
     )
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -375,8 +375,8 @@ def main():
     # -------------------------------------------------
     train_dataset = load_dataset(cfg.train_dataset_hub_id, split=cfg.train_dataset_split) if cfg.train_dataset_hub_id else None
     val_dataset = load_dataset(cfg.val_dataset_hub_id, split=cfg.val_dataset_split) if cfg.val_dataset_hub_id else None
-    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=None)
-    val_examples = build_sft_examples(tokenizer, val_dataset, cfg.val_dataset_prompt_field, cfg.val_dataset_response_field, count=None)
+    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=100)
+    val_examples = build_sft_examples(tokenizer, val_dataset, cfg.val_dataset_prompt_field, cfg.val_dataset_response_field, count=10)
 
     train_dataset = PackedSFTDataset(
         tokenized_examples=train_examples,
@@ -495,14 +495,17 @@ def main():
                 set_optimizer_lrs(optimizer_muon, optimizer_adamw, lr, cfg)
 
                 if cfg.fp16:
-                    scaler.unscale_(optimizer_muon)
                     scaler.unscale_(optimizer_adamw)
+                    scale = scaler.get_scale()
+                    for p in optimizer_muon.param_groups[0]['params']:
+                        if p.grad is not None:
+                            p.grad.data.div_(scale)
 
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), cfg.max_grad_norm)
 
                 if cfg.fp16:
-                    scaler.step(optimizer_muon)
                     scaler.step(optimizer_adamw)
+                    optimizer_muon.step()
                     scaler.update()
                 else:
                     optimizer_muon.step()
