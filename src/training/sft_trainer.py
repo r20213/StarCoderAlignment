@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from dotenv import find_dotenv, load_dotenv
+from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -460,12 +461,12 @@ def main():
         running_loss = 0.0
         running_microbatches = 0
 
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{cfg.epochs}", disable=not is_main):
             input_ids = batch["input_ids"].to(local_rank, non_blocking=True)
             labels = batch["labels"].to(local_rank, non_blocking=True)
             attention_mask = batch["attention_mask"].to(local_rank, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+            with autocast(enabled=use_amp, dtype=amp_dtype):
                 outputs = ddp_model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
