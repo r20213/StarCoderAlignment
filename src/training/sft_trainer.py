@@ -282,7 +282,7 @@ def evaluate(model, loader, local_rank, world_size, use_amp: bool, amp_dtype: to
         labels = batch["labels"].to(local_rank, non_blocking=True)
         attention_mask = batch["attention_mask"].to(local_rank, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+        with autocast(enabled=use_amp, dtype=amp_dtype):
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
