@@ -301,7 +301,7 @@ def evaluate(model, loader, local_rank, world_size, use_amp: bool, amp_dtype: to
 # =========================================================
 # 7. EXAMPLE DATA LOADING
 # =========================================================
-def build_sft_examples(tokenizer, dataset, cfg, count: int | None = None) -> List[Dict[str, Any]]:
+def build_sft_examples(tokenizer, dataset, dataset_prompt_field : str, dataset_response_field : str, count: int | None = None) -> List[Dict[str, Any]]:
     """
     Replace this with your real preprocessing.
     Each example returns input_ids and labels where prompt tokens are masked with -100.
@@ -310,8 +310,8 @@ def build_sft_examples(tokenizer, dataset, cfg, count: int | None = None) -> Lis
     total_count = count if count is not None else len(dataset)
     eos = tokenizer.eos_token_id
     for i in range(total_count):
-        prompt = dataset[i][cfg.dataset_prompt_field]
-        response = dataset[i][cfg.dataset_response_field]
+        prompt = dataset[i][dataset_prompt_field]
+        response = dataset[i][dataset_response_field]
         if len(response_ids) == 0 or response_ids[-1] != eos:
             response_ids = response_ids + [eos]
 
@@ -375,8 +375,8 @@ def main():
     # -------------------------------------------------
     train_dataset = load_dataset(cfg.train_dataset_hub_id, split=cfg.train_dataset_split) if cfg.train_dataset_hub_id else None
     val_dataset = load_dataset(cfg.val_dataset_hub_id, split=cfg.val_dataset_split) if cfg.val_dataset_hub_id else None
-    train_examples = build_sft_examples(tokenizer, train_dataset, cfg, count=None)
-    val_examples = build_sft_examples(tokenizer, val_dataset, cfg, count=None)
+    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=None)
+    val_examples = build_sft_examples(tokenizer, val_dataset, cfg.val_dataset_prompt_field, cfg.val_dataset_response_field, count=None)
 
     train_dataset = PackedSFTDataset(
         tokenized_examples=train_examples,
