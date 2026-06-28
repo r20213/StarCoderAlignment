@@ -36,7 +36,7 @@ class TrainConfig:
     max_seq_len: int = 4096
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
-    grad_accum_steps: int = 32
+    grad_accum_steps: int = 16
     epochs: int = 1
 
     adamw_base_lr: float = 2e-5
@@ -45,7 +45,7 @@ class TrainConfig:
     betas: tuple = (0.9, 0.95)
     max_grad_norm: float = 1.0
 
-    warmup_steps: int = 200
+    warmup_steps: int = 10
     min_lr_ratio: float = 0.1
 
     num_workers: int = 2
@@ -328,7 +328,7 @@ def main():
 
     train_dataset = load_dataset(cfg.train_dataset_hub_id, split=cfg.train_dataset_split) if cfg.train_dataset_hub_id else None
     val_dataset = load_dataset(cfg.val_dataset_hub_id, split=cfg.val_dataset_split) if cfg.val_dataset_hub_id else None
-    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=None)
+    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=20_000)
     val_examples = build_sft_examples(tokenizer, val_dataset, cfg.val_dataset_prompt_field, cfg.val_dataset_response_field, count=None)
 
     train_dataset = PackedSFTDataset(
