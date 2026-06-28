@@ -15,7 +15,7 @@ load_dotenv(find_dotenv())
 @dataclass
 class DPODataGenConfig:
     model_path: str = "./muon_sft_model"  # Path to your trained SFT model
-    source_dataset: str = "LastTransformer/m-a-p-CodeFeedback-Filtered-Instruction-Splits"
+    source_dataset: str = "LastTransformer/tinystarcoder-muon-sft-ddp"
     
     output_dir: str = "./dpo_generated_dataset"
     hub_repo_id: Optional[str] = "LastTransformer/tinystarcoder-dpo-dataset"
