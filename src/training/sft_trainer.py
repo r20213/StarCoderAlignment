@@ -13,9 +13,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
-from torch.optim import Muon,AdamW
+from torch.optim import Muon, AdamW
 from datasets import load_dataset
-from torch.amp import GradScaler, autocast
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv(find_dotenv())
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -60,19 +60,16 @@ class TrainConfig:
     eval_at_epoch_end: bool = True
     log_every_optimizer_step: int = 1
 
-    bf16: bool = False  # set True if your GPUs support bf16
-    fp16: bool = True   # default AMP mode
-    train_dataset_hub_id: Optional[str] = "LastTransformer/m-a-p-CodeFeedback-Filtered-Instruction-Splits"  # if you have a dataset on the hub, specify it here
+    train_dataset_hub_id: Optional[str] = "LastTransformer/m-a-p-CodeFeedback-Filtered-Instruction-Splits"
     train_dataset_split: str = "train"
-    val_dataset_hub_id: Optional[str] = "LastTransformer/m-a-p-CodeFeedback-Filtered-Instruction-Splits"  # if you have a dataset on the hub, specify it here
+    val_dataset_hub_id: Optional[str] = "LastTransformer/m-a-p-CodeFeedback-Filtered-Instruction-Splits"
     val_dataset_split: str = "validation"
     train_dataset_prompt_field: str = "query"
     train_dataset_response_field: str = "answer"
     val_dataset_prompt_field: str = "query"
     val_dataset_response_field: str = "answer"
     muon_momentum: float = 0.95  # Momentum for Muon optimizer
-    adamw_eps: float = 1e-10        # Epsilon for AdamW optimizer
-
+    adamw_eps: float = 1e-10      # Epsilon for AdamW optimizer
 
 
 # =========================================================
@@ -87,18 +84,6 @@ def set_seed(seed: int):
 # 1. PACKED DATASET
 # =========================================================
 class PackedSFTDataset(Dataset):
-    """
-    Expects already-tokenized examples:
-    [
-        {"input_ids": [...], "labels": [...]},
-        ...
-    ]
-
-    labels should already contain -100 where prompt tokens must be masked.
-    This class packs multiple examples into constant-length sequences without
-    allowing loss to spill across padding/gaps because gaps are filled with
-    pad_token_id in input_ids and -100 in labels.
-    """
     def __init__(
         self,
         tokenized_examples: List[Dict[str, List[int]]],
@@ -181,10 +166,6 @@ def cleanup_ddp():
 # 3. SFT LOSS
 # =========================================================
 def sft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """
-    Standard next-token causal LM loss with masking.
-    labels should contain -100 for tokens excluded from loss.
-    """
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
 
@@ -198,18 +179,10 @@ def sft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 # =========================================================
 # 4. PARAM GROUPING FOR MUON
 # =========================================================
-
 def build_muon_param_groups(model: torch.nn.Module):
-    """
-    Groups parameters for Muon and an auxiliary optimizer (like AdamW).
-    
-    Targeted Muon parameters must be exactly 2D and exclude structural 
-    embeddings (transformer.wte.weight, transformer.wpe.weight). 
-    """
     muon_params = []
     aux_adam_params = []
 
-    # Exact names of 2D parameters to exclude from Muon optimization
     excluded_names = {
         "transformer.wte.weight",
         "transformer.wpe.weight"
@@ -219,7 +192,6 @@ def build_muon_param_groups(model: torch.nn.Module):
         if not p.requires_grad:
             continue
 
-        # Check if the parameter satisfies the 2D requirement and isn't an embedding
         if p.ndim == 2 and name not in excluded_names:
             muon_params.append(p)
         else:
@@ -246,14 +218,9 @@ def get_cosine_warmup_lr(step: int, total_steps: int, warmup_steps: int, base_lr
 
 
 def set_optimizer_lrs(optimizer_muon, optimizer_adamw, lr: float, cfg: TrainConfig):
-    """
-    Adjusts the learning rates for Muon and AdamW optimizers independently.
-    """
-    # 1. Update Muon
     for group in optimizer_muon.param_groups:
         group["lr"] = lr
         
-    # 2. Update AdamW
     muon_to_adamw_ratio = cfg.adamw_base_lr / cfg.muon_base_lr
     adamw_lr = lr * muon_to_adamw_ratio
     
@@ -273,7 +240,7 @@ def reduce_mean(value: torch.Tensor, world_size: int) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, loader, local_rank, world_size, use_amp: bool, amp_dtype: torch.dtype):
+def evaluate(model, loader, local_rank, world_size):
     model.eval()
     loss_sum = 0.0
     num_batches = 0
@@ -283,13 +250,12 @@ def evaluate(model, loader, local_rank, world_size, use_amp: bool, amp_dtype: to
         labels = batch["labels"].to(local_rank, non_blocking=True)
         attention_mask = batch["attention_mask"].to(local_rank, non_blocking=True)
 
-        with autocast('cuda',enabled=use_amp, dtype=amp_dtype):
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-            loss = sft_loss(outputs.logits, labels)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        loss = sft_loss(outputs.logits, labels)
 
         loss_sum += reduce_mean(loss, world_size)
         num_batches += 1
@@ -309,15 +275,12 @@ def build_sft_examples(tokenizer, dataset, dataset_prompt_field : str, dataset_r
         prompt = dataset[i][dataset_prompt_field]
         response = dataset[i][dataset_response_field]
 
-        # 1. Tokenize first
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
 
-        # 2. THEN perform the check on the defined variable
         if len(response_ids) == 0 or response_ids[-1] != eos:
             response_ids = response_ids + [eos]
 
-        # 3. Construct input_ids and labels
         input_ids = prompt_ids + response_ids
         labels = ([-100] * len(prompt_ids)) + response_ids
 
@@ -336,12 +299,6 @@ def main():
 
     set_seed(cfg.seed + global_rank)
 
-    if cfg.bf16 and cfg.fp16:
-        raise ValueError("Choose only one of bf16 or fp16")
-
-    use_amp = cfg.bf16 or cfg.fp16
-    amp_dtype = torch.bfloat16 if cfg.bf16 else torch.float16
-
     if is_main:
         wandb.init(
             project=cfg.wandb_project,
@@ -354,7 +311,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_id,
-        dtype=amp_dtype if use_amp else torch.float32,
+        torch_dtype=torch.float32,
         attn_implementation="sdpa"
     )
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -369,10 +326,6 @@ def main():
         broadcast_buffers=False,
     )
 
-    # -------------------------------------------------
-    # Load train/val once at startup
-    # Replace these two calls with your real tokenized splits
-    # -------------------------------------------------
     train_dataset = load_dataset(cfg.train_dataset_hub_id, split=cfg.train_dataset_split) if cfg.train_dataset_hub_id else None
     val_dataset = load_dataset(cfg.val_dataset_hub_id, split=cfg.val_dataset_split) if cfg.val_dataset_hub_id else None
     train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=200)
@@ -428,14 +381,13 @@ def main():
 
     muon_params, aux_adam_params = build_muon_param_groups(ddp_model.module)
 
-    # Define the groups with exactly the keys expected by your specific Muon implementation
     optimizer_muon = torch.optim.Muon(
-            muon_params, 
-            lr=cfg.muon_base_lr, 
-            momentum=cfg.muon_momentum, # Ensure your TrainConfig has these keys
-            weight_decay=cfg.weight_decay,
-            adjust_lr_fn="match_rms_adamw"
-        )
+        muon_params, 
+        lr=cfg.muon_base_lr, 
+        momentum=cfg.muon_momentum, 
+        weight_decay=cfg.weight_decay,
+        adjust_lr_fn="match_rms_adamw"
+    )
 
     optimizer_adamw = torch.optim.AdamW(
         aux_adam_params, 
@@ -444,8 +396,6 @@ def main():
         betas=cfg.betas,
         eps=cfg.adamw_eps
     )
-
-    scaler = GradScaler('cuda', enabled=cfg.fp16)
 
     steps_per_epoch = len(train_loader) // cfg.grad_accum_steps
     total_optim_steps = steps_per_epoch * cfg.epochs
@@ -466,20 +416,16 @@ def main():
             labels = batch["labels"].to(local_rank, non_blocking=True)
             attention_mask = batch["attention_mask"].to(local_rank, non_blocking=True)
 
-            with autocast('cuda',enabled=use_amp, dtype=amp_dtype):
-                outputs = ddp_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                )
-                loss = sft_loss(outputs.logits, labels)
-                raw_loss = loss.detach()
-                loss = loss / cfg.grad_accum_steps
+            outputs = ddp_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            loss = sft_loss(outputs.logits, labels)
+            raw_loss = loss.detach()
+            loss = loss / cfg.grad_accum_steps
 
-            if cfg.fp16:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            loss.backward()
 
             running_loss += reduce_mean(raw_loss, world_size)
             running_microbatches += 1
@@ -494,22 +440,10 @@ def main():
                 )
                 set_optimizer_lrs(optimizer_muon, optimizer_adamw, lr, cfg)
 
-                if cfg.fp16:
-                    scaler.unscale_(optimizer_adamw)
-                    scale = scaler.get_scale()
-                    for p in optimizer_muon.param_groups[0]['params']:
-                        if p.grad is not None:
-                            p.grad.data.div_(scale)
-
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), cfg.max_grad_norm)
 
-                if cfg.fp16:
-                    scaler.step(optimizer_adamw)
-                    optimizer_muon.step()
-                    scaler.update()
-                else:
-                    optimizer_muon.step()
-                    optimizer_adamw.step()
+                optimizer_muon.step()
+                optimizer_adamw.step()
 
                 optimizer_muon.zero_grad(set_to_none=True)
                 optimizer_adamw.zero_grad(set_to_none=True)
@@ -540,12 +474,9 @@ def main():
                 loader=val_loader,
                 local_rank=local_rank,
                 world_size=world_size,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
             )
 
             if is_main:
-                # Calculate the exact current state of AdamW learning rate for the eval step log
                 adamw_current_lr = optimizer_adamw.param_groups[0]["lr"]
                 muon_current_lr = optimizer_muon.param_groups[0]["lr"]
                 logger.info(
@@ -553,8 +484,8 @@ def main():
                 )
                 wandb.log({
                     "val/loss": val_loss,
-                    "val/muon_lr": muon_current_lr,           # Added for clean tracking tracking
-                    "val/adamw_lr": adamw_current_lr, # Added for clean tracking tracking
+                    "val/muon_lr": muon_current_lr,
+                    "val/adamw_lr": adamw_current_lr,
                     "epoch": epoch,
                     "step": optim_step,
                 })
