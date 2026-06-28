@@ -48,7 +48,7 @@ class TrainConfig:
     warmup_steps: int = 200
     min_lr_ratio: float = 0.1
 
-    num_workers: int = 4
+    num_workers: int = 2
     seed: int = 42
 
     wandb_project: str = "tinystarcoder-muon-sft-ddp"
@@ -311,7 +311,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_id,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         attn_implementation="sdpa"
     )
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -328,8 +328,8 @@ def main():
 
     train_dataset = load_dataset(cfg.train_dataset_hub_id, split=cfg.train_dataset_split) if cfg.train_dataset_hub_id else None
     val_dataset = load_dataset(cfg.val_dataset_hub_id, split=cfg.val_dataset_split) if cfg.val_dataset_hub_id else None
-    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=200)
-    val_examples = build_sft_examples(tokenizer, val_dataset, cfg.val_dataset_prompt_field, cfg.val_dataset_response_field, count=10)
+    train_examples = build_sft_examples(tokenizer, train_dataset, cfg.train_dataset_prompt_field, cfg.train_dataset_response_field, count=None)
+    val_examples = build_sft_examples(tokenizer, val_dataset, cfg.val_dataset_prompt_field, cfg.val_dataset_response_field, count=None)
 
     train_dataset = PackedSFTDataset(
         tokenized_examples=train_examples,
