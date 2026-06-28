@@ -39,8 +39,8 @@ class TrainConfig:
     grad_accum_steps: int = 16
     epochs: int = 1
 
-    adamw_base_lr: float = 2e-5
-    muon_base_lr: float = 0.02 # Use the industry standard lr for Muon.
+    adamw_base_lr: float = 1e-5
+    muon_base_lr: float = 0.002 # Use the industry standard lr for Muon.
     weight_decay: float = 0.01
     betas: tuple = (0.9, 0.95)
     max_grad_norm: float = 1.0
