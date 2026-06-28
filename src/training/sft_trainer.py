@@ -36,8 +36,8 @@ class TrainConfig:
     max_seq_len: int = 4096
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
-    grad_accum_steps: int = 7
-    epochs: int = 3
+    grad_accum_steps: int = 32
+    epochs: int = 1
 
     adamw_base_lr: float = 2e-5
     muon_base_lr: float = 0.02 # Use the industry standard lr for Muon.
